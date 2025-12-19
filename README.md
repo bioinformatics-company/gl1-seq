@@ -1,407 +1,351 @@
-# gl1enc — ultra-light 2-bit / 4-bit / 6-bit sequence encoder/decoder
+# GL1ENC — GL1 Sequence Codec Engine Specification (GL1ENCv2)
 
-`gl1enc.py` is a **single-file**, **zero-dependency** Python tool for encoding and decoding biological sequences into a compact **`.gl1` container**.
+This document specifies **GL1ENCv2**, the canonical encoding used by GL1 to convert
+sequence strings into bytes for:
 
-It supports:
+- hashing (Blob IDs, Merkle leaves, commit roots),
+- storage (on‑chain bytes or IPFS payload bytes),
+- strict on‑chain/off‑chain parity (Solidity must match these rules exactly).
 
-- **NUC2 (2-bit nucleotides):** `A C G T` (optionally accepts `U` and stores it as `T` unless strict)
-- **NUC4 (4-bit nucleotides, SAM/BAM NT16):** `= A C M G R S V T W Y H K D B N` (IUPAC ambiguity codes)
-- **NUC4_U (4-bit nucleotides with explicit U):** preserves RNA `U` by using code `0` for `U`
-- **PROT6 (6-bit proteins):** 20 amino acids + `* X B Z J U O -`
-
-This is intended as a practical **binary payload layer** that is fast to encode/decode and easy to integrate into indexing, storage, chunk/NFT pipelines, and Web2/Web3 distribution.
+This spec corresponds to **`gl1enc.py` module version 2.0.0**.
 
 ---
 
-## Table of contents
+## 1) Scope
 
-- [Benefits](#benefits)
-  - [Compact storage](#compact-storage)
-  - [Fast IO + large sequence support](#fast-io--large-sequence-support)
-  - [Interoperability-friendly](#interoperability-friendly)
-  - [Practical workflows](#practical-workflows)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Input formats](#input-formats)
-  - [`--format auto` (default)](#--format-auto-default)
-  - [FASTA](#fasta)
-  - [FASTQ](#fastq)
-  - [RAW](#raw)
-  - [Gzip input](#gzip-input)
-- [Output: what is a `.gl1` file?](#output-what-is-a-gl1-file)
-- [Encoding mode selection (AUTO)](#encoding-mode-selection-auto)
-  - [Protein vs nucleotide inference](#protein-vs-nucleotide-inference)
-  - [Nucleotide codec in AUTO](#nucleotide-codec-in-auto)
-- [Command reference](#command-reference)
-  - [`encode`](#1-encode)
-  - [`decode`](#2-decode)
-  - [`info`](#3-info)
-- [Examples (realistic)](#examples-realistic)
-- [Performance tips](#performance-tips)
-- [Limitations (current)](#limitations-current)
-- [File naming](#file-naming)
-- [License (Public Domain)](#license-public-domain)
+GL1ENC defines how a sequence string (DNA/RNA/protein/symbolic sequences) is:
+
+1. **normalized** into a canonical uppercase, whitespace-free string, and
+2. **encoded** into bytes using one of these encodings:
+
+| Encoding | ID (uint8) | Bits / symbol | Typical use |
+|---|---:|---:|---|
+| DNA2 | 0 | 2 | ultra‑compact A/C/G/T genomes |
+| DNA4 | 2 | 4 | IUPAC nucleotide ambiguity codes (fast bitmask semantics) |
+| SIXBIT | 3 | 6 | proteins and other symbolic strings within a fixed 64‑char alphabet |
+| ASCII | 1 | 8 | future‑proof fallback for any normalized ASCII |
+
+> GL1ENC does **not** define hashing (keccak256) itself. It only defines the exact byte representation.
 
 ---
 
-## Benefits
+## 2) Versioning and identifiers
 
-### Compact storage
+- Encoding wire-format identifier: `GL1ENC_FORMAT = "GL1ENCv2"`
+- Python module semantic version: `__version__ = "2.0.0"`
 
-- **2-bit nucleotides:** ~4× smaller than ASCII sequence text  
-- **4-bit nucleotides:** ~2× smaller than ASCII while supporting ambiguity  
-- **6-bit proteins:** ~25% smaller than ASCII proteins  
-
-### Fast IO + large sequence support
-
-- Chunking keeps memory bounded even for whole chromosomes.
-- Decoding is LUT-based for nucleotides (very fast).
-
-### Interoperability-friendly
-
-- 4-bit nucleotide mode mirrors the **SAM/BAM NT16 symbol ordering** (`=ACMGRSVTWYHKDBN`), so it’s easy to map to/from HTS tooling internals.
-- Output can be decoded back to normal FASTA anytime.
-
-### Practical workflows
-
-- One `.gl1` file can store **multiple sequences** (multi-FASTA / FASTQ reads).
-- The tool can **decode a single file**, **many files**, or **an entire folder** (recursive optional).
+Any breaking change to **normalization**, **canonical selection order**, **alphabets**, or **bit packing** requires bumping `GL1ENC_FORMAT`.
 
 ---
 
-## Installation
+## 3) Normalization
 
-No installation needed. Just copy the script.
+Before any encoding, the input sequence is normalized.
 
-```bash
-chmod +x gl1enc.py
-./gl1enc.py --help
-```
+### 3.1 Algorithm
 
-**Requirements:** Python 3.8+ (stdlib only)
+Given input `seq`:
 
----
+1. `seq = seq.strip()`
+2. `seq = seq.upper()`
+3. Remove the following characters **anywhere** in the string:
+   - space `' '`
+   - newline `'\n'`
+   - carriage return `'\r'`
+   - tab `'\t'`
 
-## Quick start
+The result is `normalized_seq`.
 
-### Encode a large FASTA (recommended chunking)
+### 3.2 Notes
 
-```bash
-python3 gl1enc.py encode -i chr1.fa -o chr1.gl1 --chunk 1000000
-python3 gl1enc.py info -i chr1.gl1
-```
-
-### Decode back to FASTA
-
-```bash
-python3 gl1enc.py decode -i chr1.gl1 -o chr1_out.fa --to fasta --wrap 60
-```
-
-### Decode a whole folder (one FASTA per `.gl1`)
-
-```bash
-python3 gl1enc.py decode -i ./gl1_folder -o ./decoded --to fasta --wrap 60
-```
-
-### Decode a folder recursively
-
-```bash
-python3 gl1enc.py decode -i ./gl1_folder -o ./decoded --recursive
-```
-
-### Combine many `.gl1` files into one FASTA (avoid name collisions)
-
-```bash
-python3 gl1enc.py decode -i ./gl1_folder --recursive -o all.fa --prefix-file
-```
+- Normalization is intentionally simple and Solidity-portable.
+- Non-ASCII characters are **not** removed; they will cause ASCII encoding to fail.
+- **Symbol length** used elsewhere in GL1 is `L = len(normalized_seq)`.
 
 ---
 
-## Input formats
+## 4) Canonical encoding selection
 
-### `--format auto` (default)
+Given normalized sequence `s`:
 
-Auto-detects by the first meaningful line:
+1. If `s` is **non-empty** and consists only of `A`, `C`, `G`, `T`: choose **DNA2** (ID 0)
+2. Else if every char is within the **DNA4 alphabet**: choose **DNA4** (ID 2)
+3. Else if every char is within the **SIXBIT alphabet (ALPH64)**: choose **SIXBIT** (ID 3)
+4. Else choose **ASCII** (ID 1)
 
-- `>` → **FASTA**
-- `@` → **FASTQ**
-- otherwise → **RAW**
+The empty string `""` is encoded as **ASCII**.
 
-### FASTA
-
-Multi-record FASTA becomes multiple records inside one `.gl1` container.
-
-Example:
-
-```text
->seq1
-ACGTACGT...
->seq2
-ACGTNRY...
-```
-
-➡️ `out.gl1` contains 2 records: `seq1`, `seq2`
-
-### FASTQ
-
-Each read becomes a record; qualities are skipped (sequence only).
-
-### RAW
-
-Whole file becomes a single record named `seq1` (whitespace removed).
-
-### Gzip input
-
-If input ends with `.gz`, it’s read transparently.
+This order is deterministic and always prefers the most compact eligible encoding.
 
 ---
 
-## Output: what is a `.gl1` file?
+## 5) DNA2 encoding (ID 0, 2-bit)
 
-A `.gl1` is a container that can hold one or many records (sequences). Each record has:
+### 5.1 Eligibility
 
-- name
-- kind: nucleotide or protein
-- codec: NUC2 / NUC4_BAM / NUC4_U / PROT6
-- length
-- chunk size and chunk count
-- chunk payload bytes
+DNA2 may be used only if the normalized sequence is:
+- non-empty, and
+- contains only: `A C G T`
 
-Chunking is internal. Decoding automatically concatenates chunks back into the original sequence.
+### 5.2 Base-to-bit mapping
+
+| Base | Bits | Value |
+|---|---|---:|
+| A | `00` | 0 |
+| C | `01` | 1 |
+| G | `10` | 2 |
+| T | `11` | 3 |
+
+### 5.3 Packing order (4 bases per byte)
+
+Within each output byte:
+
+- base0 → bits 7..6 (MSB)
+- base1 → bits 5..4
+- base2 → bits 3..2
+- base3 → bits 1..0 (LSB)
+
+If the final group has fewer than 4 bases, remaining 2-bit slots are padded with `00` (A).
+
+### 5.4 Byte length
+
+For base length `L`:
+
+```
+byte_len = ceil(L / 4) = (L + 3) // 4
+```
+
+### 5.5 Canonical validity (MUST)
+
+A DNA2 payload is canonical iff:
+1. `len(data_bytes) == byte_len`
+2. Unused padded 2-bit slots in the final byte are all `00`.
 
 ---
 
-## Encoding mode selection (AUTO)
+## 6) DNA4 encoding (ID 2, 4-bit nibble / IUPAC bitmask)
 
-### Protein vs nucleotide inference
+DNA4 is designed for **efficient ambiguity-aware matching**.
 
-Heuristic:
+### 6.1 Semantics: bitmask over {A,C,G,T}
 
-- If the record contains characters that strongly imply protein (e.g. `E,F,I,L,P,Q,O,J,Z,X,*`) → protein
-- Otherwise, if it fits nucleotide + IUPAC alphabet → nucleotide
+Each symbol encodes a 4-bit mask:
 
-If you have edge cases, force the mode with `--encode`.
+- `A = 0001 (0x1)`
+- `C = 0010 (0x2)`
+- `G = 0100 (0x4)`
+- `T = 1000 (0x8)`
 
-### Nucleotide codec in AUTO
+Ambiguity codes are bitwise ORs of the above.
+A special `GAP` symbol `'-'` is encoded as `0000 (0x0)`.
 
-- Only `A,C,G,T` → **NUC2**
-- If ambiguity is present (`N,R,Y,S,W,K,M,B,D,H,V,=`) → **NUC4**
-- If `U` is present:
-  - AUTO prefers **NUC4_U** (preserve `U`) unless you force `--nuc4-table bam`
+Matching property:
+- A concrete base `b` matches ambiguity symbol `x` iff `(mask(b) & mask(x)) != 0`.
+
+### 6.2 Alphabet and nibble values
+
+| Char | Meaning | Nibble (hex) | Bits |
+|---|---|---:|---|
+| `-` | GAP | 0x0 | 0000 |
+| `A` | A | 0x1 | 0001 |
+| `C` | C | 0x2 | 0010 |
+| `G` | G | 0x4 | 0100 |
+| `T` | T | 0x8 | 1000 |
+| `M` | A or C | 0x3 | 0011 |
+| `R` | A or G | 0x5 | 0101 |
+| `S` | C or G | 0x6 | 0110 |
+| `V` | A or C or G | 0x7 | 0111 |
+| `W` | A or T | 0x9 | 1001 |
+| `Y` | C or T | 0xA | 1010 |
+| `H` | A or C or T | 0xB | 1011 |
+| `K` | G or T | 0xC | 1100 |
+| `D` | A or G or T | 0xD | 1101 |
+| `B` | C or G or T | 0xE | 1110 |
+| `N` | A or C or G or T | 0xF | 1111 |
+
+Notes:
+- DNA4 intentionally does **not** include `U` (RNA). If `U` appears, SIXBIT or ASCII is used.
+
+### 6.3 Packing order (2 symbols per byte)
+
+For symbols `(s0, s1)`:
+
+- `s0` nibble is stored in the **high nibble** (bits 7..4)
+- `s1` nibble is stored in the **low nibble** (bits 3..0)
+
+If `L` is odd, the final low nibble is padded with `0x0` (GAP).
+
+### 6.4 Byte length
+
+For symbol length `L`:
+
+```
+byte_len = ceil(L / 2) = (L + 1) // 2
+```
+
+### 6.5 Canonical validity (MUST)
+
+A DNA4 payload is canonical iff:
+1. `len(data_bytes) == byte_len`
+2. If `L` is odd, the last byte’s low nibble is `0x0`
+3. Every used nibble is one of the values listed above.
 
 ---
 
-## Command reference
+## 7) SIXBIT encoding (ID 3, 6-bit packed ALPH64)
 
-### 1) `encode`
+SIXBIT is for symbolic sequences that fit into a fixed 64-character alphabet. It is useful for protein sequences and many other uppercase symbolic strings.
 
-Encode FASTA/FASTQ/RAW into `.gl1`.
+### 7.1 ALPH64 definition (MUST)
 
-```bash
-python3 gl1enc.py encode -i INPUT -o OUTPUT.gl1 [options]
+The alphabet is an ordered string of exactly 64 characters:
+
+```
+ALPH64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-*._:;,|/\\+=()[]{}<>#$%&?!@^"
 ```
 
-#### Flags
+The 6-bit code of a character is its **index** in this string (0..63).
 
-- `-i, --in PATH`  
-  Input file path (FASTA/FASTQ/RAW). `.gz` supported.  
-  Use `-` for stdin (spooled to a temp file because encoding is two-pass in auto mode).
+### 7.2 Eligibility
 
-- `-o, --out PATH`  
-  Output `.gl1` file.
+SIXBIT may be used iff every character of the normalized sequence is in ALPH64.
 
-- `--format {auto,fasta,fastq,raw}`  
-  Force input parser.
+### 7.3 Packing order (bitstream)
 
-- `--encode {auto,2bit,4bit,6bit}`  
-  Force encoding mode:
-  - `2bit` → NUC2 (only `A,C,G,T,U`)
-  - `4bit` → NUC4 (IUPAC; uses `--nuc4-table`)
-  - `6bit` → PROT6
-  - `auto` → per-record decision
+SIXBIT concatenates 6-bit codes MSB-first into a bitstream, then outputs bytes.
 
-- `--chunk N`  
-  Chunk size in symbols (bases/residues).  
-  `0` = unchunked (one chunk per record; can use lots of RAM for big sequences)
+- Codes are appended in sequence order.
+- The final byte is padded with **0 bits** (on the right / LSBs) if necessary.
 
-  Recommended:
-  - whole chromosome: `--chunk 1000000` to `--chunk 4000000`
-  - protein sets: `--chunk 200000`
+### 7.4 Byte length
 
-- `--nuc4-table {auto,bam,u}`  
-  Controls 4-bit nucleotide mapping:
-  - `bam`: SAM/BAM NT16 (`=ACMGRSVTWYHKDBN`). U is mapped to T unless `--strict`.
-  - `u`: preserve U using code 0.
-  - `auto`: choose `u` if U appears, else `bam`.
+For symbol length `L`:
 
-- `--strict`  
-  Strict validation (fail on anything not representable). Examples:
-  - `--encode 2bit --strict` fails if U appears
-  - `--encode 4bit --nuc4-table bam --strict` fails if U appears
+```
+byte_len = ceil((L * 6) / 8) = (L*6 + 7) // 8
+```
 
-- `--unknown-to-x`  
-  Protein mode: map unknown letters to X instead of error.  
-  Also relaxes `--encode 6bit` validation to accept any A–Z (mapped to X if unknown).
+### 7.5 Canonical validity (MUST)
+
+A SIXBIT payload is canonical iff:
+1. `len(data_bytes) == byte_len`
+2. Unused padding bits in the final byte (if any) are all zero.
 
 ---
 
-### 2) `decode`
+## 8) ASCII encoding (ID 1, 8-bit)
 
-Decode `.gl1` to FASTA or raw. Supports single file, multiple files, and folders.
+### 8.1 Rules
 
-```bash
-python3 gl1enc.py decode -i INPUT [INPUT2 ...] -o OUT [options]
-```
+The normalized sequence is encoded as ASCII:
 
-#### Inputs
+- `data_bytes = normalized_seq.encode("ascii")`
+- `length = len(normalized_seq)`
 
-`-i/--in` accepts:
+### 8.2 Canonical validity (MUST)
 
-- one or more `.gl1` files
-- directories containing `.gl1` files
+An ASCII payload is canonical iff:
+1. `len(data_bytes) == length`
+2. `data_bytes` are valid ASCII bytes
 
-#### Outputs
-
-You have two output patterns:
-
-**A) Combine all decoded output into one file (or stdout)**
-
-```bash
-python3 gl1enc.py decode -i a.gl1 b.gl1 -o combined.fa --prefix-file
-```
-
-**B) One output per input `.gl1`**
-
-```bash
-python3 gl1enc.py decode -i ./folder -o ./decoded
-# or explicitly:
-python3 gl1enc.py decode -i ./folder --outdir ./decoded
-```
-
-#### Flags
-
-- `-i, --in ...`  
-  List of files/folders.
-
-- `-o, --out PATH`  
-  `-` = stdout (default).  
-  If you pass a directory path, it writes one output per input file.
-
-- `--outdir DIR`  
-  Explicit directory for per-file outputs (overrides `--out`).
-
-- `--recursive`  
-  If inputs include directories, scan subfolders too.
-
-- `--to {fasta,raw}`  
-  Output format:
-  - `fasta` = headers + sequence
-  - `raw` = sequence only (no headers)
-
-- `--wrap N`  
-  FASTA line wrap length (default 60).  
-  `0` = no wrap.
-
-- `--record NAME`  
-  Decode only the record with this exact name (applies per input `.gl1` file).
-
-- `--prefix-file`  
-  When combining outputs from multiple input files, prefix record names with `<file>|` to avoid collisions.
+ASCII is the “future‑proof” fallback when a symbol is not in DNA2/DNA4/SIXBIT alphabets.
 
 ---
 
-### 3) `info`
+## 9) Reverse complement helper
 
-Summarize `.gl1` file(s). Supports folders.
+GL1ENC defines a reverse-complement helper for strand handling.
 
-```bash
-python3 gl1enc.py info -i file.gl1
-python3 gl1enc.py info -i ./folder --recursive
+### 9.1 Normalization-first
+
+Reverse complement is defined over the **normalized sequence**.
+
+### 9.2 Complement mapping (IUPAC)
+
+Mapping (uppercase):
+
+- `A ↔ T`
+- `C ↔ G`
+- `R ↔ Y`
+- `K ↔ M`
+- `B ↔ V`
+- `D ↔ H`
+- `S ↔ S`, `W ↔ W`, `N ↔ N`
+- `U → A` (if present; note `U` is not DNA4-eligible but is supported by the helper)
+- `- → -`, `* → *`, `. → .`
+
+Unknown characters are left unchanged.
+
+### 9.3 Operation
+
 ```
-
-Shows per record:
-
-- kind (NUC/PROT)
-- codec (NUC2 / NUC4_BAM / NUC4_U / PROT6)
-- length
-- chunk size + chunk count
-- flags
-
----
-
-## Examples (realistic)
-
-### Multi-FASTA: two sequences, different codecs inside `one.gl1`
-
-If `seq1` is pure A/C/G/T and `seq2` has ambiguity codes:
-
-```bash
-python3 gl1enc.py encode -i two_seqs.fa -o two_seqs.gl1 --chunk 500
-python3 gl1enc.py info -i two_seqs.gl1
-```
-
-Expected:
-
-- `seq1` → NUC2, chunks = 10 (for 5000 bases, chunk 500)
-- `seq2` → NUC4_*, chunks = 10
-
-### Force 2-bit (only A/C/G/T/U allowed)
-
-```bash
-python3 gl1enc.py encode -i clean.fa -o clean.gl1 --encode 2bit --chunk 1000000
-```
-
-### Force 4-bit BAM table (U→T unless strict)
-
-```bash
-python3 gl1enc.py encode -i asm.fa -o asm.gl1 --encode 4bit --nuc4-table bam
-```
-
-### Preserve U in RNA explicitly
-
-```bash
-python3 gl1enc.py encode -i rna.fa -o rna.gl1 --encode 4bit --nuc4-table u
-```
-
-### Protein one
-
-```bash
-python3 gl1enc.py encode -i proteins.faa -o proteins.gl1 --encode 6bit --chunk 200000
+reverse_complement(seq) = reverse( complement( normalize(seq) ) )
 ```
 
 ---
 
-## Performance tips
+## 10) Test vectors (MUST)
 
-- For chromosome-scale data: always use `--chunk` (e.g., 1,000,000).
-- Avoid `--chunk 0` for large sequences (it buffers the entire record).
-- AUTO mode is two-pass (scan then encode). If you need single-pass streaming, you must force `--encode` and we can add a streaming-only path.
+These vectors must match in Python and Solidity implementations.
+
+### 10.1 DNA2 vectors
+
+1. `seq = "ACGT"`
+   - normalized: `"ACGT"`
+   - bytes: `0x1b`
+   - length: `4`
+
+2. `seq = "T"`
+   - bytes: `0xc0`
+   - length: `1`
+
+3. `seq = "ACGTAC"`
+   - bytes: `0x1b10`
+   - length: `6`
+
+### 10.2 DNA4 vectors
+
+1. `seq = "A"`
+   - bytes: `0x10` (A in high nibble, pad 0 in low nibble)
+   - length: `1`
+
+2. `seq = "ACGT"`
+   - A=0x1, C=0x2 → byte0 `0x12`
+   - G=0x4, T=0x8 → byte1 `0x48`
+   - bytes: `0x1248`
+   - length: `4`
+
+3. `seq = "N-"`
+   - N=0xF, '-'=0x0 → byte `0xF0`
+   - bytes: `0xF0`
+   - length: `2`
+
+### 10.3 SIXBIT vectors
+
+Using ALPH64 index codes (A=0,B=1,C=2,D=3):
+
+- `seq = "ABCD"`
+- codes: `0,1,2,3`
+- packed bytes: `0x001083`
+- length: `4`
+
+### 10.4 Canonical selection vectors
+
+- `"ACGT"` → DNA2
+- `"ACGN"` → DNA4
+- `"MKWVTFISLL"` → SIXBIT
+- `""` → ASCII
+
+### 10.5 Reverse complement vector
+
+- `"AAGT"` → `"ACTT"`
 
 ---
 
-## Limitations (current)
+## 11) Solidity porting notes
 
-- Lowercase masking is not preserved (presence is recorded in flags only).
-- FASTQ qualities are not stored (sequence only).
-- Auto protein/nucleotide detection is heuristic; for edge cases use `--encode`.
-
----
-
-## File naming
-
-Filenames do not need to encode codec info because `info` is the source of truth.
-
-If you enforce a single codec per file (forced mode), optional human hints are fine:
-
-- `chr1__nuc2.gl1`
-- `asm__nuc4bam.gl1`
-- `transcripts__nuc4u.gl1`
-- `uniprot__prot6.gl1`
-
----
-
-## License (Public Domain)
-
-This project is dedicated to the public domain by Bioinformatics Company, using **The Unlicense**.
-
-See `LICENSE` for the full text.
+- If you accept string input on-chain, normalization is expensive.
+  Most designs will accept *already-normalized bytes* (or store bytes).
+- Always store `length` alongside encoded bytes for DNA2/DNA4/SIXBIT.
+- Enforce canonical padding bits/nibbles to prevent alternate encodings of the same logical string.
+- Keep encoding IDs stable forever. If you ever need a new mapping/alphabet, introduce a new format version.
